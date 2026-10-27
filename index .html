@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Object Detection + Audio Alert</title>
+<style>
+  :root { --bg:#0f1418; --panel:#182027; --line:#2a353e; --fg:#e8eef2; --mute:#8fa1ad;
+          --safe:#2fa84f; --warn:#f2b01e; --danger:#e5483d; --accent:#4cc3d9; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,"Noto Sans Thai",sans-serif; }
+  .wrap { max-width:980px; margin:0 auto; padding:16px; display:grid; gap:16px; }
+  h1 { font-size:1.25rem; margin:0; }
+  p.sub { margin:4px 0 0; color:var(--mute); }
+  .stage { position:relative; background:#000; border-radius:10px; overflow:hidden; aspect-ratio:4/3; border:1px solid var(--line); }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  .status { position:absolute; left:0; right:0; top:0; padding:10px 14px; font-weight:700; font-size:1.05rem;
+            background:var(--safe); color:#fff; z-index:2; transition:background .2s; }
+  .status.warn { background:var(--warn); color:#222; } .status.danger { background:var(--danger); }
+  .idle { position:absolute; inset:0; display:grid; place-items:center; text-align:center; color:var(--mute); padding:24px; z-index:1; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; display:grid; gap:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+  label { display:grid; gap:4px; color:var(--mute); font-size:.9rem; min-width:0; }
+  label b { color:var(--fg); font-weight:600; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  select, button { font:inherit; padding:8px 12px; border-radius:8px; border:1px solid var(--line); background:#222d35; color:var(--fg); }
+  button.primary { background:var(--accent); color:#06222a; border-color:var(--accent); font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.5; }
+  .chk { display:flex; gap:8px; align-items:center; color:var(--fg); }
+  .msg { color:var(--mute); font-size:.9rem; min-height:1.4em; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ระบบตรวจจับวัตถุด้วย AI พร้อมเสียงเตือน</h1>
+    <p class="sub">ตรวจจับ คน / รถ / สุนัข จากกล้อง ประมวลผลในเบราว์เซอร์ของคุณ ภาพไม่ถูกส่งออกไปที่ไหน</p>
+  </header>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="status" id="status">พร้อมใช้งาน</div>
+    <div class="idle" id="idle">กด “เริ่มตรวจจับ” แล้วอนุญาตการใช้กล้อง</div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <button class="primary" id="startBtn">เริ่มตรวจจับ</button>
+      <button id="stopBtn" disabled>หยุด</button>
+      <label style="min-width:200px">กล้อง
+        <select id="cameraSel"><option value="">กล้องเริ่มต้น</option></select>
+      </label>
+      <span class="msg" id="msg"></span>
+    </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="beepOn" checked> เสียงบี๊บ</label>
+      <label class="chk"><input type="checkbox" id="speechOn" checked> เสียงพูด</label>
+      <label class="chk">ภาษา
+        <select id="lang"><option value="th-TH">ไทย</option><option value="en-US">English</option></select>
+      </label>
+    </div>
+    <div class="grid">
+      <label><span>ความมั่นใจขั้นต่ำ: <b id="confV">60%</b></span><input type="range" id="conf" min="30" max="90" value="60"></label>
+      <label><span>มุมมองกล้องแนวนอน: <b id="fovV">65°</b></span><input type="range" id="fov" min="40" max="110" value="65"></label>
+      <label><span>ระยะอันตราย (ต่ำกว่า): <b id="dangerV">1.0 ม.</b></span><input type="range" id="danger" min="3" max="30" value="10"></label>
+      <label><span>ระยะระวัง (ต่ำกว่า): <b id="warnV">2.5 ม.</b></span><input type="range" id="warn" min="10" max="80" value="25"></label>
+    </div>
+    <p class="msg">ระยะเป็นค่าประมาณจากความสูงของกรอบ (คน 1.7 ม., รถ 1.5 ม., สุนัข 0.5 ม.) ปรับ “มุมมองกล้อง” ให้ตรงกับระยะจริงโดยลองยืนที่ 1 และ 2 เมตร ใช้เป็นตัวช่วยเตือนเท่านั้น ไม่ควรใช้แทนการระวังด้วยตัวเองหรืองานด้านความปลอดภัย</p>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+"use strict";
+const REAL_H = { person: 1.7, car: 1.5, dog: 0.5 };
+const TONE = { person: 1200, dog: 900, car: 600 };
+const HISTORY = 5, CONFIRM = 3;
+const REPEAT = { 1: 6000, 2: 2500 };
+const COLORS = { 0: "#2fa84f", 1: "#f2b01e", 2: "#e5483d" };
+const LEVEL_TEXT = { 0: "ปลอดภัย", 1: "ระวัง", 2: "อันตราย" };
+const OBJ_NAME = {
+  "th-TH": { person: "คน", car: "รถ", dog: "สุนัข" },
+  "en-US": { person: "person", car: "car", dog: "dog" }
+};
+const SAY = {
+  "th-TH": { 1: o => `ระวัง มี${o}อยู่ข้างหน้า`, 2: o => `อันตราย ${o}อยู่ใกล้มาก` },
+  "en-US": { 1: o => `Caution, ${o} ahead`, 2: o => `Danger, ${o} very close` }
+};
+
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+let model = null, stream = null, running = false;
+let history = [], state = { cls: null, level: 0 };
+let audioCtx = null, nextBeep = 0, lastKey = null, lastSpoken = 0;
+
+/* ---------- ตั้งค่า ---------- */
+const val = id => Number($(id).value);
+function bindRange(id, outId, fmt) {
+  const f = () => { $(outId).textContent = fmt(val(id)); };
+  $(id).addEventListener("input", f); f();
+}
+bindRange("conf", "confV", v => v + "%");
+bindRange("fov", "fovV", v => v + "°");
+bindRange("danger", "dangerV", v => (v / 10).toFixed(1) + " ม.");
+bindRange("warn", "warnV", v => (v / 10).toFixed(1) + " ม.");
+
+function setMsg(t) { $("msg").textContent = t; }
+
+/* ---------- เสียง ---------- */
+function beep(hz, ms) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.value = hz; o.type = "sine";
+  const t = audioCtx.currentTime;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.25, t + 0.01);
+  g.gain.linearRampToValueAtTime(0, t + ms / 1000);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t); o.stop(t + ms / 1000 + 0.02);
+}
+function speak(text) {
+  if (!("speechSynthesis" in window)) return;
+  const lang = $("lang").value;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = lang; u.rate = 1.0;
+  const v = speechSynthesis.getVoices().find(x => x.lang.replace("_", "-").toLowerCase().startsWith(lang.slice(0, 2).toLowerCase()));
+  if (v) u.voice = v;
+  speechSynthesis.speak(u);
+}
+function audioTick() {
+  if (!running) return;
+  const { cls, level } = state, now = performance.now();
+  if (!cls || level === 0) { lastKey = null; return; }
+  if ($("beepOn").checked && now >= nextBeep) {
+    const on = level === 2 ? 80 : 150, off = level === 2 ? 70 : 450;
+    beep(TONE[cls], on); nextBeep = now + on + off;
+  }
+  if ($("speechOn").checked) {
+    const key = cls + level;
+    const text = SAY[$("lang").value][level](OBJ_NAME[$("lang").value][cls]);
+    if (key !== lastKey) { speechSynthesis.cancel(); speak(text); lastKey = key; lastSpoken = now; }
+    else if (now - lastSpoken >= REPEAT[level] && !speechSynthesis.speaking) { speak(text); lastSpoken = now; }
+  }
+}
+setInterval(audioTick, 40);
+
+/* ---------- กล้อง ---------- */
+async function listCameras() {
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    const sel = $("cameraSel"), cur = sel.value;
+    sel.innerHTML = '<option value="">กล้องเริ่มต้น</option>';
+    devs.forEach((d, i) => {
+      const o = document.createElement("option");
+      o.value = d.deviceId; o.textContent = d.label || "กล้อง " + (i + 1);
+      sel.appendChild(o);
+    });
+    sel.value = cur;
+  } catch (e) { /* ไม่เป็นไร */ }
+}
+
+async function start() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setMsg("เบราว์เซอร์นี้ใช้กล้องไม่ได้ (ต้องเปิดผ่าน https)"); return;
+  }
+  $("startBtn").disabled = true;
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  if ("speechSynthesis" in window) { speechSynthesis.speak(new SpeechSynthesisUtterance("")); }  // ปลดล็อกเสียงพูดบนมือถือ
+  try {
+    if (!model) {
+      setMsg("กำลังโหลดโมเดล AI (ครั้งแรกอาจใช้เวลาสักครู่)...");
+      await tf.ready();
+      model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+    }
+    setMsg("กำลังเปิดกล้อง...");
+    const id = $("cameraSel").value;
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: id ? { deviceId: { exact: id } } : { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    await listCameras();
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    document.querySelector(".stage").style.aspectRatio = video.videoWidth + "/" + video.videoHeight;
+    $("idle").hidden = true;
+    running = true; history = []; setMsg("กำลังตรวจจับ");
+    $("stopBtn").disabled = false;
+    loop();
+  } catch (e) {
+    const name = e && e.name;
+    setMsg(name === "NotAllowedError" ? "ไม่ได้รับอนุญาตให้ใช้กล้อง กรุณาอนุญาตในเบราว์เซอร์แล้วลองใหม่"
+         : name === "NotFoundError" ? "ไม่พบกล้อง"
+         : "เริ่มไม่สำเร็จ: " + (e && e.message ? e.message : e));
+    $("startBtn").disabled = false;
+  }
+}
+
+function stop() {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  state = { cls: null, level: 0 };
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  $("idle").hidden = false; $("startBtn").disabled = false; $("stopBtn").disabled = true;
+  setStatus(0, "พร้อมใช้งาน"); setMsg("");
+}
+
+/* ---------- ตรวจจับ ---------- */
+const levelOf = d => d < val("danger") / 10 ? 2 : d < val("warn") / 10 ? 1 : 0;
+
+function setStatus(level, text) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = "status" + (level === 1 ? " warn" : level === 2 ? " danger" : "");
+}
+
+async function loop() {
+  while (running) {
+    const preds = await model.detect(video);
+    const w = video.videoWidth;
+    const f = (w / 2) / Math.tan((val("fov") * Math.PI / 180) / 2);
+    const dets = preds
+      .filter(p => REAL_H[p.class] && p.score >= val("conf") / 100)
+      .map(p => ({ cls: p.class, score: p.score, box: p.bbox, dist: REAL_H[p.class] * f / Math.max(p.bbox[3], 1) }));
+
+    const nearest = dets.length ? dets.reduce((a, b) => (b.dist < a.dist ? b : a)) : null;
+    history.push(nearest ? nearest.cls : null);
+    if (history.length > HISTORY) history.shift();
+
+    let confirmed = null;
+    const counts = {};
+    history.forEach(c => { if (c) counts[c] = (counts[c] || 0) + 1; });
+    const top = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    if (top && counts[top] >= CONFIRM && nearest && nearest.cls === top) confirmed = nearest;
+
+    const level = confirmed ? levelOf(confirmed.dist) : 0;
+    state = { cls: confirmed ? confirmed.cls : null, level };
+
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    ctx.lineWidth = 3; ctx.font = "bold 18px system-ui,sans-serif";
+    dets.forEach(d => {
+      const c = COLORS[levelOf(d.dist)], [x, y, bw, bh] = d.box;
+      ctx.strokeStyle = c; ctx.strokeRect(x, y, bw, bh);
+      const label = `${OBJ_NAME["en-US"][d.cls]} ${Math.round(d.score * 100)}% ~${d.dist.toFixed(1)}m`;
+      const tw = ctx.measureText(label).width + 10;
+      ctx.fillStyle = c; ctx.fillRect(x, Math.max(y - 24, 0), tw, 24);
+      ctx.fillStyle = "#fff"; ctx.fillText(label, x + 5, Math.max(y - 6, 18));
+    });
+
+    setStatus(level, confirmed
+      ? `${LEVEL_TEXT[level]} | ${OBJ_NAME["th-TH"][confirmed.cls]} ${Math.round(confirmed.score * 100)}% ประมาณ ${confirmed.dist.toFixed(1)} ม.`
+      : "ไม่พบวัตถุ");
+    await new Promise(r => setTimeout(r, 30));
+  }
+}
+
+$("startBtn").addEventListener("click", start);
+$("stopBtn").addEventListener("click", stop);
+if ("speechSynthesis" in window) speechSynthesis.onvoiceschanged = () => {};
+</script>
+</body>
+</html>
